@@ -1,11 +1,20 @@
+"""Phase 2 experimental track — deviates from SPEC.md.
+
+Deviations (see spcn_deviation.py):
+1. Kaiming weight init instead of spec's randn() * 0.01.
+2. Classification loss backpropagated into the top hidden layer
+   (breaks spec's local-only learning constraint).
+
+phase2.py remains the spec-compliant baseline; this file is for comparison.
+"""
+
 import os
 import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from spcn.grid import Grid
-from spcn.training import train_mnist
+from spcn_deviation import DeviationGrid, train_mnist_deviation
 from spcn.viz import plot_error_curve
 from data.mnist_loader import load_mnist
 from baselines.mlp import SimpleMLP
@@ -14,19 +23,21 @@ GRID_W = 28
 GRID_H = 28
 GRID_D = 4
 RADIUS = 2
-Z_RADIUS = 3
 NUM_DIGITS = 10
 LR = 0.1
 LAMBDA = 0.0001
 ALPHA = 0.5
-SETTLE_ITERS = 6
 EPOCHS = 3
+BACKPROP_SCALE = 0.1
 
 
 def main():
     print("=" * 60)
-    print("Phase 2: MNIST Classification")
+    print("Phase 2 (DEVIATION): Kaiming init + backprop loss injection")
     print("=" * 60)
+    print()
+    print("This deviates from SPEC.md's local-only learning constraint.")
+    print("See spcn_deviation.py for details. phase2.py is the spec baseline.")
     print()
 
     print("Loading MNIST...")
@@ -34,17 +45,17 @@ def main():
     print(f"Train: {X_train.shape}, Test: {X_test.shape}")
     print()
 
-    print("Training SPCN (28×28×4 + 10-digit head)...")
-    grid = Grid(GRID_W, GRID_H, GRID_D, radius=RADIUS, z_radius=Z_RADIUS, num_digits=NUM_DIGITS)
-    spcn_history = train_mnist(
+    print("Training SPCN (28×28×4 + 10-digit head, Kaiming init + backprop)...")
+    grid = DeviationGrid(GRID_W, GRID_H, GRID_D, radius=RADIUS, num_digits=NUM_DIGITS)
+    spcn_history = train_mnist_deviation(
         grid, X_train, y_train, X_test, y_test,
         epochs=EPOCHS, learning_rate=LR, lambda_penalty=LAMBDA, alpha=ALPHA,
-        settle_iters=SETTLE_ITERS, homeostatic_rate=0.0
+        backprop_scale=BACKPROP_SCALE,
     )
     print()
 
     spcn_final_test = spcn_history["test_acc"][-1] if spcn_history["test_acc"] else 0
-    print(f"SPCN final test accuracy: {spcn_final_test:.3f}")
+    print(f"SPCN (deviation) final test accuracy: {spcn_final_test:.3f}")
 
     spcn_params = (GRID_W * GRID_H * GRID_D * (2 * RADIUS + 1) ** 2) + (GRID_W * GRID_H * GRID_D * NUM_DIGITS)
     print(f"SPCN parameters: {spcn_params:,}")
@@ -87,14 +98,13 @@ def main():
 
     print()
     print("=" * 60)
-    print("Results Summary")
+    print("Results Summary (DEVIATION run)")
     print("=" * 60)
     print(f"SPCN test accuracy:  {spcn_final_test:.3f} ({spcn_params:,} params)")
     print(f"MLP test accuracy:   {mlp_test_acc[-1]:.3f} ({mlp_params:,} params)")
     print(f"Difference:          {abs(spcn_final_test - mlp_test_acc[-1]):.3f}")
     print()
-    print("SPCN uses purely local learning rules (no global backprop), per spec.")
-    print("This comparison documents that result against an MLP baseline of similar size.")
+    print("Compare against phase2.py (spec-compliant, local-only learning) for baseline.")
 
 
 if __name__ == "__main__":

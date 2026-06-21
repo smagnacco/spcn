@@ -26,11 +26,13 @@ def create_simple_model():
 class OpenVINOGrid:
     """Grid with OpenVINO acceleration."""
 
-    def __init__(self, width, height, depth, radius=2, num_digits=None, device="AUTO"):
+    def __init__(self, width, height, depth, radius=2, z_radius=1, gamma=1.0, num_digits=None, device="AUTO"):
         self.width = width
         self.height = height
         self.depth = depth
         self.radius = radius
+        self.z_radius = z_radius
+        self.gamma = gamma
         self.num_digits = num_digits
         self.device = device
 
@@ -38,17 +40,22 @@ class OpenVINOGrid:
         self.prediction = np.zeros((width, height, depth), dtype=np.float32)
         self.error = np.zeros((width, height, depth), dtype=np.float32)
 
-        offset_size = 2 * radius + 1
-        fan_in = offset_size * offset_size
-        kaiming_scale = np.sqrt(2.0 / fan_in)
-        self.weights = np.random.randn(width, height, depth, offset_size, offset_size).astype(np.float32) * kaiming_scale
+        offset_xy = 2 * radius + 1
+        offset_z = z_radius + 1
+        fan_in = offset_xy * offset_xy * offset_z
+        weight_scale = 1.0 / np.sqrt(fan_in)
+        self.weights = np.random.randn(
+            width, height, depth, offset_xy, offset_xy, offset_z
+        ).astype(np.float32) * weight_scale
 
         if num_digits:
-            fan_in_digit = width * height * depth
-            kaiming_scale_digit = np.sqrt(2.0 / fan_in_digit)
-            self.digit_weights = np.random.randn(width, height, depth, num_digits).astype(np.float32) * kaiming_scale_digit * 100
+            from .grid import build_digit_prototypes
+            digit_fan_in = width * height
+            digit_weight_scale = 1.0 / np.sqrt(digit_fan_in)
+            self.digit_weights = np.random.randn(width, height, num_digits).astype(np.float32) * digit_weight_scale
             self.digit_output = np.zeros(num_digits, dtype=np.float32)
             self.digit_target = np.zeros(num_digits, dtype=np.float32)
+            self.digit_prototypes = build_digit_prototypes(width, height, num_digits)
 
         self.ie = Core()
         self.compiled_model = None
@@ -65,7 +72,7 @@ class OpenVINOGrid:
             self.compiled_model = None
 
     def reset_state(self):
-        self.state[:, :, 1:] = 0
+        self.state = np.random.uniform(0, 0.1, (self.width, self.height, self.depth)).astype(np.float32)
         self.prediction = np.zeros((self.width, self.height, self.depth), dtype=np.float32)
         self.error = np.zeros((self.width, self.height, self.depth), dtype=np.float32)
 

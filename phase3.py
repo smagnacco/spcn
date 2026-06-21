@@ -5,7 +5,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from spcn.grid import Grid
-from spcn.training import train_mnist
+from spcn.training import train_mnist_contrastive
 from spcn.viz import plot_error_curve
 from data.mnist_loader import load_mnist
 from baselines.mlp import SimpleMLP
@@ -20,13 +20,26 @@ LR = 0.1
 LAMBDA = 0.0001
 ALPHA = 0.5
 SETTLE_ITERS = 6
-EPOCHS = 3
+DIGIT_LR = 0.005
+CONTRASTIVE_RATE = 0.05
+EPOCHS = 5
 
 
 def main():
     print("=" * 60)
-    print("Phase 2: MNIST Classification")
+    print("Phase 3: MNIST Classification with Contrastive Hebbian Update")
     print("=" * 60)
+    print()
+    print("See FINDINGS_PHASE2.md: phase 2's local reconstruction + faded")
+    print("top-down clamp gave the top layer real input-dependent variance,")
+    print("but it collapsed to predicting a single class regardless of")
+    print("input (mode collapse), because nothing pulled same-class states")
+    print("together or pushed different-class states apart. This phase adds")
+    print("that as a local, pairwise contrastive Hebbian update, spread")
+    print("through every layer at every settle iteration (see neuron.py's")
+    print("update_contrastive). Verified: train accuracy now climbs")
+    print("smoothly across epochs instead of saturating or staying flat --")
+    print("but test accuracy does not yet generalize (see FINDINGS doc).")
     print()
 
     print("Loading MNIST...")
@@ -34,12 +47,13 @@ def main():
     print(f"Train: {X_train.shape}, Test: {X_test.shape}")
     print()
 
-    print("Training SPCN (28×28×4 + 10-digit head)...")
+    print("Training SPCN (28×28×4 + 10-digit head + contrastive update)...")
     grid = Grid(GRID_W, GRID_H, GRID_D, radius=RADIUS, z_radius=Z_RADIUS, num_digits=NUM_DIGITS)
-    spcn_history = train_mnist(
+    spcn_history = train_mnist_contrastive(
         grid, X_train, y_train, X_test, y_test,
         epochs=EPOCHS, learning_rate=LR, lambda_penalty=LAMBDA, alpha=ALPHA,
-        settle_iters=SETTLE_ITERS, homeostatic_rate=0.0
+        settle_iters=SETTLE_ITERS, homeostatic_rate=0.0,
+        digit_learning_rate=DIGIT_LR, contrastive_rate=CONTRASTIVE_RATE
     )
     print()
 
@@ -94,7 +108,8 @@ def main():
     print(f"Difference:          {abs(spcn_final_test - mlp_test_acc[-1]):.3f}")
     print()
     print("SPCN uses purely local learning rules (no global backprop), per spec.")
-    print("This comparison documents that result against an MLP baseline of similar size.")
+    print("Contrastive update is pairwise and local: each sample only reads")
+    print("its own settled state and per-class running prototypes.")
 
 
 if __name__ == "__main__":
