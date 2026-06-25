@@ -69,11 +69,27 @@ allocation/protección, no gradiente global.
 | 5 | **Protección "EWC local sin Fisher"** (`protect_gamma`) | Rigidez por unidad: `plasticity = 1/(1 + γ·consistencia_pre_task)`. La consistencia top-k (`sqrt(freq)`, consolidada como `max` across tasks, congelada pre-task) hace de **proxy local de importancia**. | Recupera retención (ver §5) sin ningún gradiente global. | Es EWC sin matriz de Fisher: la importancia de un peso se deriva solo de la actividad local, no de un gradiente del loss. |
 | 6 | **Barrido `protect_gamma`** | γ ∈ {0, 1, 2, 5, 10}, misma init. | La frontera completa (§5). | El paso decisivo: ningún γ iguala a EWC en ambos ejes. El techo es estructural, no de tuning. |
 
-## 4. Resultado positivo: allocation ortogonal por aprendizaje local
+## 4. Resultado positivo: allocation ortogonal **emergente** sin controlador central
 
-Con recruitment bias + protección (pasos 3-5), el SPCN produce **allocation
-ortogonal entre el núcleo protegido y los núcleos nuevos**, vía aprendizaje
-local sin backprop ni controlador central:
+Este es el aporte positivo real del proyecto, e independiente de que la frontera
+quede interior a EWC: el SPCN produce **allocation ortogonal entre tasks de forma
+emergente, a partir de aprendizaje puramente local**, sin máscaras explícitas ni
+un controlador que asigne capacidad.
+
+La distinción con el estado del arte es de *mecanismo*, no de resultado. PackNet
+y HAT también consiguen poblaciones disjuntas por task —pero mediante
+**asignación explícita**: PackNet podando y fijando una máscara binaria de pesos
+por task; HAT aprendiendo máscaras de atención por unidad con un controlador y
+una pérdida dedicada. En ambos, *algo a nivel de red decide* qué capacidad va a
+qué task. Acá no hay ese nivel: la separación cae sola del recruitment bias local
+(`score = act − β·commitment`, evaluado por neurona, sin ver el resto de la red)
+más la protección por consistencia. **Ninguna neurona sabe a qué task pertenece;
+ningún módulo asigna.** La ortogonalidad es un efecto de segundo orden de reglas
+estrictamente locales — que es exactamente la propiedad que uno querría de un
+sustrato biológicamente plausible.
+
+Con recruitment bias + protección (pasos 3-5), el SPCN produce esa allocation
+ortogonal entre el núcleo protegido y los núcleos nuevos, sin backprop:
 
 ```
 Núcleos consistentes (top layer, γ=2.0):
@@ -94,9 +110,18 @@ Fisher, que requiere gradientes globales.
 T1 queda disjunto de todo lo demás porque es lo que se protege; pero T2 y T3
 compiten por el mismo pool de neuronas frescas y terminan compartiendo ~58% del
 núcleo (Jaccard 0.576). El mecanismo protege contra el núcleo *consolidado*, no
-particiona el espacio entero a priori. La capa inferior (L1) reporta 0 unidades
-"consistentes" bajo el umbral de over-uso (×1.5 sobre uniforme): la
-especialización medible vive en la top layer.
+particiona el espacio entero a priori.
+
+Una aclaración sobre la métrica: la capa inferior (L1) reporta 0 unidades
+"consistentes" bajo el umbral de over-uso (×1.5 sobre la frecuencia uniforme).
+Esto **no** significa que L1 no haga trabajo —lo hace, transforma la entrada para
+las dos capas de arriba— sino que la métrica de consistencia top-k pierde
+resolución en una capa cuya distribución de activación es casi-uniforme: ahí
+ninguna unidad supera el umbral de over-uso aunque el conjunto sí compute algo
+útil. La especialización **medible** vive en la top layer porque es donde reside
+la representación más discriminativa, que es justamente donde uno espera ver
+selectividad por task. Que la señal aparezca en L2 y no en L1 es lo esperable,
+no una anomalía.
 
 ## 5. Resultado negativo / techo estructural (el hallazgo central)
 
@@ -224,12 +249,16 @@ entonces tocar (o cruzar) la de EWC sin introducir backprop global.
 ## Qué NO dice este finding
 
 El SPCN **no le gana a EWC**. El resultado no es "el local learning resuelve
-continual learning". El resultado es: **(a)** la frontera de Pareto del SPCN
-escalar, medida; **(b)** el mecanismo del techo (la activación escalar no puede
-preservar y adaptar un rol a la vez); y **(c)** la dirección que ese mecanismo
-motiva (estructura interna vía fase). Allocation ortogonal sin controlador
-central es un resultado positivo real, pero acotado: no cierra la brecha con
-EWC por sí solo.
+continual learning". El resultado es: **(a)** allocation ortogonal **emergente**
+entre tasks a partir de reglas estrictamente locales, sin controlador central ni
+máscaras explícitas —a diferencia de PackNet/HAT, que logran lo mismo pero por
+asignación explícita (§4); **(b)** la frontera de Pareto del SPCN escalar,
+medida; **(c)** el mecanismo del techo (la activación escalar no puede preservar
+y adaptar un rol a la vez); y **(d)** la dirección que ese mecanismo motiva
+(estructura interna vía fase). El aporte (a) es positivo y real; lo que es
+acotado es su *alcance*: la allocation emergente no cierra por sí sola la brecha
+de Pareto con EWC, y por eso el proyecto apunta a la representación compleja (§6),
+no a más allocation.
 
 ## Archivos
 
