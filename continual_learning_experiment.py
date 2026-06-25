@@ -194,8 +194,15 @@ class EWC:
 # ─────────────────────────────────────────────────────────────────
 
 class PCLayer:
-    """Capa de Predictive Coding con homeostasis y update contrastivo."""
-    def __init__(self, in_dim, out_dim, lr=0.004, clr=0.002, lam=0.05, target=0.15, ema=0.005):
+    """Capa de Predictive Coding con homeostasis, update contrastivo y
+    activacion sparse top-k (inspirado en la selectividad poblacional
+    esparsa observada en Cai et al., Nature 2026: solo una fraccion
+    pequena de neuronas responde fuertemente a cada feature). Solo las
+    k_active unidades con mayor activacion sobreviven al forward pass;
+    el resto se fuerza a 0 y NO recibe update en ese paso (no firing ->
+    no plasticity), tanto en hebbian_update como en contrastive_update."""
+    def __init__(self, in_dim, out_dim, lr=0.004, clr=0.002, lam=0.05, target=0.15, ema=0.005,
+                 k_active=None, recruit_beta=1.0, protect_gamma=0.1):
         self.W   = np.random.randn(out_dim, in_dim) / np.sqrt(in_dim)
         self.b   = np.zeros(out_dim)
         self.lr  = lr
@@ -204,26 +211,101 @@ class PCLayer:
         self.target = target
         self.ema_rate = ema
         self.ema_state = np.full(out_dim, target)
+        self.k = k_active if k_active is not None else out_dim
+        self.recruit_beta = recruit_beta
+        self.protect_gamma = protect_gamma
+        # Tracker de commitment: cuenta cuantas veces cada unidad fue parte
+        # del top-k. INMUNE a la homeostasis (solo crece), a diferencia de
+        # ema_state que la homeostasis empuja hacia target y por tanto pierde
+        # la informacion de "que neuronas ya estan comprometidas". Cumple un
+        # doble rol: (1) recruitment bias en forward() y (2) rigidez de los
+        # updates en hebbian/contrastive_update — ver _plasticity().
+        self.commitment = np.zeros(out_dim)
+        # protection_strength[i] in [0,1]: maxima CONSISTENCIA (fraccion de
+        # muestras en que la neurona estuvo en el top-k) alcanzada en alguna
+        # task previa. Es la senal de IMPORTANCIA para la proteccion — distinta
+        # del commitment crudo (conteo acumulado), que mide OCUPACION y sirve
+        # para recruitment pero satura como proxy de importancia. snapshot
+        # congelado al inicio de cada task -> proteccion estrictamente
+        # entre-tasks (analogo a la Fisher congelada de EWC).
+        self.protection_strength = np.zeros(out_dim)
+        self.protection_snapshot = np.zeros(out_dim)
+        self._last_active_idx = np.arange(out_dim)
 
     def _sig(self, x):
         return 1.0 / (1.0 + np.exp(-np.clip(x, -20, 20)))
 
     def forward(self, x):
-        return self._sig(self.W @ x + self.b)
+        z = self.W @ x + self.b
+        a = self._sig(z)
+        if self.k < len(a):
+            # Recruitment bias (allocation dependiente de actividad): el top-k
+            # se elige sobre un score que combina activacion del input con un
+            # penalty por commitment historico, ambos normalizados a [0,1] para
+            # que recruit_beta tenga una escala interpretable. Esto reserva
+            # neuronas poco comprometidas para tasks futuras. La mascara/valor
+            # de salida usan la activacion REAL a, no el score.
+            a_norm = (a - a.min()) / (np.ptp(a) + 1e-8)
+            c_norm = self.commitment / (self.commitment.max() + 1e-8)
+            score = a_norm - self.recruit_beta * c_norm
+            idx = np.argpartition(score, -self.k)[-self.k:]
+            mask = np.zeros_like(a)
+            mask[idx] = 1.0
+            a = a * mask
+            self._last_active_idx = idx
+        else:
+            self._last_active_idx = np.arange(len(a))
+        return a
+
+    def mark_commitment(self):
+        """Registra que las unidades del ultimo top-k fueron usadas. No lo
+        toca la homeostasis — preserva la senal de allocation entre tasks."""
+        self.commitment[self._last_active_idx] += 1.0
+
+    def freeze_protection(self):
+        """Congela el snapshot de protection_strength al inicio de una task.
+        La proteccion de esta task usa este snapshot (estado pre-task) -> solo
+        protege neuronas que fueron NUCLEO consistente de tasks anteriores;
+        las neuronas frescas que la task en curso empieza a usar NO se
+        auto-congelan."""
+        self.protection_snapshot = self.protection_strength.copy()
+
+    def consolidate_protection(self, freq_in_task):
+        """Al cerrar una task, consolida la consistencia: para cada neurona,
+        protection_strength = max(protection_strength, freq_in_task), donde
+        freq_in_task[i] in [0,1] es la fraccion de muestras de la task en que
+        la neurona i estuvo en el top-k. Asi la importancia de una neurona es
+        su consistencia maxima across todas las tasks vistas."""
+        self.protection_strength = np.maximum(self.protection_strength, freq_in_task)
+
+    def _plasticity(self, active):
+        """Factor de rigidez por unidad activa, proporcional a su CONSISTENCIA
+        pre-task (snapshot): plasticity = 1/(1 + protect_gamma * snapshot[active]).
+        Solo las neuronas que fueron nucleo consistente (freq top-k alta) de
+        una task previa se congelan; las tocadas de pasada (freq baja) quedan
+        plasticas. Es EWC local sin matriz de Fisher: la consistencia top-k
+        hace de proxy local de importancia, derivado solo de la actividad
+        (sin gradiente global, sin backprop)."""
+        return 1.0 / (1.0 + self.protect_gamma * self.protection_snapshot[active])
 
     def hebbian_update(self, x, state):
         pred = self.forward(x)
         err  = state - pred
-        self.W += self.lr * np.outer(err, x)
-        self.b += self.lr * err
-        # Homeostasis
-        self.ema_state += self.ema_rate * (state - self.ema_state)
-        self.b += self.ema_rate * (self.target - self.ema_state)
+        active = self._last_active_idx
+        plast = self._plasticity(active)
+        self.W[active] += self.lr * plast[:, None] * np.outer(err[active], x)
+        self.b[active] += self.lr * plast * err[active]
+        # Homeostasis — solo sobre las unidades activas (no se escala por
+        # plasticity: es regulacion intrinseca, no aprendizaje de la task)
+        self.ema_state[active] += self.ema_rate * (state[active] - self.ema_state[active])
+        self.b[active] += self.ema_rate * (self.target - self.ema_state[active])
 
     def contrastive_update(self, x, s_pos, s_neg):
         diff = np.tanh(s_pos - s_neg)
-        self.W += self.clr * np.outer(diff, x)
-        self.b += self.clr * diff
+        active = self._last_active_idx
+        plast = self._plasticity(active)
+        self.W[active] += self.clr * plast[:, None] * np.outer(diff[active], x)
+        self.b[active] += self.clr * plast * diff[active]
 
 
 class SPCN:
@@ -234,8 +316,21 @@ class SPCN:
     y el target de firing rate, lo que naturalmente ralentiza el olvido.
     """
     def __init__(self, in_dim=784, h1=128, h2=64, n_classes=5,
-                 lr=0.004, clr=0.002):
-        self.layers   = [PCLayer(in_dim, h1, lr, clr), PCLayer(h1, h2, lr, clr)]
+                 lr=0.004, clr=0.002, sparse_frac=0.15, recruit_beta=1.0,
+                 protect_gamma=0.1):
+        """sparse_frac: fraccion de unidades activas por top-k mask en cada
+        PCLayer (k_active = round(sparse_frac * out_dim)). sparse_frac=None
+        o >=1.0 desactiva el top-k (equivalente al comportamiento previo).
+        recruit_beta: sesgo de reclutamiento; reserva neuronas poco
+        comprometidas para tasks futuras al elegir el top-k.
+        protect_gamma: rigidez proporcional al commitment (EWC local sin
+        Fisher); congela los pesos de neuronas comprometidas en tasks previas."""
+        k1 = max(1, round(sparse_frac * h1)) if sparse_frac else None
+        k2 = max(1, round(sparse_frac * h2)) if sparse_frac else None
+        self.layers   = [PCLayer(in_dim, h1, lr, clr, k_active=k1,
+                                 recruit_beta=recruit_beta, protect_gamma=protect_gamma),
+                         PCLayer(h1, h2, lr, clr, k_active=k2,
+                                 recruit_beta=recruit_beta, protect_gamma=protect_gamma)]
         self.n_cls    = n_classes
         self.hW       = np.random.randn(n_classes, h2) * 0.01
         self.hb       = np.zeros(n_classes)

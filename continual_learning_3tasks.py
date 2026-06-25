@@ -35,12 +35,17 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
 from continual_learning_experiment import DEVICE, load_data, PCLayer
+from utils import specialization_index, population_specialization
 
 OUT_DIR = 'output/continual'
 N_CLASSES_TOTAL = 10
 TASK_SPLITS = ((0, 4), (4, 7), (7, 10))
 TASK_LABELS_RANGE = ['0-3', '4-6', '7-9']
 N_TASKS = 3
+SPCN_SPARSE_FRAC = 0.15    # k_active = 15% de out_dim por PCLayer (Cambio 1)
+SPCN_RECRUIT_BETA = 1.0    # sesgo de reclutamiento por commitment normalizado [0,1] (Fix correcto)
+SPCN_CLR = 0.01            # contrastive learning rate, subido de 0.002 (un cambio a la vez, hlr intacto)
+SPCN_PROTECT_GAMMA = 2.0   # rigidez por consistencia sqrt(freq); punto operativo del barrido (Plast~EWC)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -50,14 +55,19 @@ N_TASKS = 3
 class MLP10(nn.Module):
     def __init__(self, input_dim=784, hidden=256, n_classes=N_CLASSES_TOTAL):
         super().__init__()
-        self.net = nn.Sequential(
+        self.encoder = nn.Sequential(
             nn.Linear(input_dim, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden), nn.ReLU(),
-            nn.Linear(hidden, n_classes),
         )
+        self.head = nn.Linear(hidden, n_classes)
 
     def forward(self, x):
-        return self.net(x)
+        return self.head(self.encoder(x))
+
+    def get_hidden(self, x):
+        """Activaciones de la penultima capa (encoder), para specialization_index."""
+        with torch.no_grad():
+            return self.encoder(x).cpu().numpy()
 
 
 def masked_ce(logits, y_global, class_lo, class_hi):
@@ -134,10 +144,14 @@ class EWC10:
 def run_mlp_multitask(data, n_tasks, epochs, use_ewc, ewc_lambda=400.0):
     """Entrena un MLP10 (naive o EWC) secuencialmente sobre n_tasks con
     head unico compartido. Devuelve acc_matrix[i][j] = accuracy (unmasked,
-    10-way) en task j+1 evaluado en test, tras terminar de entrenar task i+1."""
+    10-way) en task j+1 evaluado en test, tras terminar de entrenar task i+1.
+    Tambien devuelve task_activations[t] = activaciones del encoder (penultima
+    capa) sobre el test set de la task t, recogidas justo despues de
+    entrenar esa task (peak), para specialization_index."""
     model = MLP10().to(DEVICE)
     ewc_terms = []
     acc_matrix = [[None] * n_tasks for _ in range(n_tasks)]
+    task_activations = [None] * n_tasks
     label = 'mlp_ewc' if use_ewc else 'mlp_naive'
 
     for t in range(n_tasks):
@@ -156,6 +170,9 @@ def run_mlp_multitask(data, n_tasks, epochs, use_ewc, ewc_lambda=400.0):
         if use_ewc:
             ewc_terms.append(EWC10(model, Xtr, ytr_global, lo, hi, ewc_lambda=ewc_lambda))
 
+        Xte_t, _ = data[f'task{t+1}']['test']
+        task_activations[t] = model.get_hidden(Xte_t)
+
         for j in range(t + 1):
             jlo, jhi = TASK_SPLITS[j]
             Xte, yte_local = data[f'task{j+1}']['test']
@@ -165,23 +182,38 @@ def run_mlp_multitask(data, n_tasks, epochs, use_ewc, ewc_lambda=400.0):
         print(f"  [{label}] after T{t+1}: " +
               "  ".join(f"T{j+1}={acc_matrix[t][j]:.3f}" for j in range(t + 1)))
 
-    return acc_matrix
+    return acc_matrix, task_activations
 
 
 # ─────────────────────────────────────────────────────────────────
 # SPCN class-incremental — single shared 10-way head
 # ─────────────────────────────────────────────────────────────────
 
-def run_spcn_multitask(data, n_tasks, epochs):
+def run_spcn_multitask(data, n_tasks, epochs, sparse_frac=SPCN_SPARSE_FRAC,
+                       recruit_beta=SPCN_RECRUIT_BETA, protect_gamma=SPCN_PROTECT_GAMMA):
     """SPCN con head unico de 10 clases. El cuerpo predictive-coding
     (2 PCLayers, misma regla local, mismos hiperparametros que en
     continual_learning_experiment.py) se entrena de forma continua sin
     reset entre tasks. El head se actualiza con masked softmax: el
     gradiente de cross-entropy solo se calcula sobre las clases de la
-    task actual, pero los 10 logits siempre se computan."""
+    task actual, pero los 10 logits siempre se computan.
+
+    sparse_frac aplica el top-k mask (Cambio 1) a cada PCLayer: solo
+    k_active = round(sparse_frac * out_dim) unidades sobreviven por
+    forward pass, y solo esas reciben update Hebbiano/contrastivo.
+    Arquitectura (in/h1/h2), clr/prototypes y distance_lambda intactos.
+
+    Devuelve tambien task_activations[t] = activaciones de la top layer
+    (h2, post top-k mask) sobre el test set de la task t, recogidas justo
+    despues de entrenarla, para specialization_index."""
     np_d = data['np']
 
-    layers = [PCLayer(784, 128, lr=0.004, clr=0.002), PCLayer(128, 64, lr=0.004, clr=0.002)]
+    k1 = max(1, round(sparse_frac * 128)) if sparse_frac else None
+    k2 = max(1, round(sparse_frac * 64)) if sparse_frac else None
+    layers = [PCLayer(784, 128, lr=0.004, clr=SPCN_CLR, k_active=k1,
+                      recruit_beta=recruit_beta, protect_gamma=protect_gamma),
+              PCLayer(128, 64, lr=0.004, clr=SPCN_CLR, k_active=k2,
+                      recruit_beta=recruit_beta, protect_gamma=protect_gamma)]
     hW = np.random.randn(N_CLASSES_TOTAL, 64) * 0.01
     hb = np.zeros(N_CLASSES_TOTAL)
     hlr = 0.003
@@ -207,10 +239,22 @@ def run_spcn_multitask(data, n_tasks, epochs):
         correct = sum(predict_unmasked(X[i]) == y_global[i] for i in range(len(y_global)))
         return correct / len(y_global)
 
+    def collect_top_activations(X):
+        return np.array([forward(x)[-1] for x in X])
+
+    # Instrumentacion (metrica honesta): contador por-task de cuantas veces
+    # cada unidad estuvo en el top-k, por layer. Se resetea por task. El set
+    # "consistente" = unidades en top-k en >= frac de las muestras de la task.
+    topk_count_this_task = [np.zeros(128), np.zeros(64)]
+    n_samples_this_task = [0]
+
     def train_sample(x, label_global, class_lo, class_hi):
         states = forward(x)
         for i, L in enumerate(layers):
             L.hebbian_update(states[i], states[i + 1])
+            topk_count_this_task[i][L._last_active_idx] += 1.0
+            L.mark_commitment()   # tracker de commitment inmune a homeostasis
+        n_samples_this_task[0] += 1
 
         top = states[-1]
         a = 0.008
@@ -244,16 +288,80 @@ def run_spcn_multitask(data, n_tasks, epochs):
         hb[:] -= hlr * grad
 
     acc_matrix = [[None] * n_tasks for _ in range(n_tasks)]
+    train_acc_per_task = [None] * n_tasks   # train acc de cada task al final de su fase
+    task_activations = [None] * n_tasks
+    consistent_sets = []   # consistent_sets[t] = [set_L1, set_L2] de la task t
+    # Umbral relativo a la frecuencia uniforme esperada (k/out_dim): una unidad
+    # es "del nucleo" si aparece en el top-k >= OVERUSE_MULT veces lo esperado
+    # por azar. Un umbral absoluto (ej 0.5) da sets vacios porque con top-k
+    # por-muestra ninguna neurona individual supera ~0.22 de las muestras.
+    OVERUSE_MULT = 1.5
+    uniform_frac = [k1 / 128, k2 / 64]
+
+    def jaccard(a, b):
+        if not a and not b:
+            return 0.0
+        return len(a & b) / len(a | b)
 
     for t in range(n_tasks):
         lo, hi = TASK_SPLITS[t]
         Xtr, ytr_local = np_d[f'X{t+1}tr'], np_d[f'y{t+1}tr']
         ytr_global = ytr_local + lo
 
+        topk_count_this_task[0][:] = 0
+        topk_count_this_task[1][:] = 0
+        n_samples_this_task[0] = 0
+
+        # Congelar protection_strength pre-task: la proteccion de esta task
+        # usa este snapshot (solo protege nucleos consistentes de tasks PREVIAS)
+        for L in layers:
+            L.freeze_protection()
+
         for ep in range(epochs):
             idx = np.random.permutation(len(Xtr))
             for i in idx:
                 train_sample(Xtr[i], ytr_global[i], lo, hi)
+
+        Xte_t = np_d[f'X{t+1}te']
+        task_activations[t] = collect_top_activations(Xte_t)
+
+        # Train accuracy de esta task al final de su fase (10-way unmasked),
+        # para distinguir under-fitting (clr bajo) de overfitting (neuronas
+        # frescas memorizando pocas muestras): train alto + test bajo =
+        # overfitting; train bajo + test bajo = under-fitting.
+        train_acc_per_task[t] = evaluate(Xtr, ytr_global)
+
+        # Metrica honesta: set "consistente" = unidades que estuvieron en el
+        # top-k en >= CONSISTENT_FRAC de las muestras de esta task.
+        n_s = n_samples_this_task[0]
+        task_sets = []
+        for li in range(2):
+            counts = topk_count_this_task[li]
+            thresh = OVERUSE_MULT * uniform_frac[li] * n_s
+            consistent = set(np.where(counts >= thresh)[0].tolist())
+            task_sets.append(consistent)
+            # Consolidar la consistencia de esta task en la senal de proteccion:
+            # protection_strength = max(prev, sqrt(freq)). La compresion sqrt
+            # levanta la COLA de la distribucion (freq 0.25 -> 0.5) para que las
+            # muchas neuronas de baja-media consistencia que igual sostienen la
+            # representacion de la task queden protegidas, sin tocar las de
+            # freq~0 (sqrt(0)=0) que son las frescas disponibles para tasks
+            # futuras. Sin umbral/binarizacion: proteccion graduada continua.
+            freq_in_task = counts / max(n_s, 1)
+            layers[li].consolidate_protection(np.sqrt(freq_in_task))
+        consistent_sets.append(task_sets)
+
+        # Jaccard contra T1 (set consistente) por layer, para detectar si los
+        # nucleos de cada task se separan (objetivo: Jaccard < 0.5)
+        if t > 0:
+            j_l1 = jaccard(task_sets[0], consistent_sets[0][0])
+            j_l2 = jaccard(task_sets[1], consistent_sets[0][1])
+            print(f"  [spcn] T{t+1} nucleo consistente — "
+                  f"L1: {len(task_sets[0])} units (Jaccard vs T1 = {j_l1:.2f})  "
+                  f"L2: {len(task_sets[1])} units (Jaccard vs T1 = {j_l2:.2f})")
+        else:
+            print(f"  [spcn] T1 nucleo consistente — "
+                  f"L1: {len(task_sets[0])} units  L2: {len(task_sets[1])} units")
 
         for j in range(t + 1):
             jlo, jhi = TASK_SPLITS[j]
@@ -262,9 +370,19 @@ def run_spcn_multitask(data, n_tasks, epochs):
             acc_matrix[t][j] = evaluate(Xte, yte_global)
 
         print(f"  [spcn] after T{t+1}: " +
-              "  ".join(f"T{j+1}={acc_matrix[t][j]:.3f}" for j in range(t + 1)))
+              "  ".join(f"T{j+1}={acc_matrix[t][j]:.3f}" for j in range(t + 1)) +
+              f"   (train T{t+1}={train_acc_per_task[t]:.3f})")
 
-    return acc_matrix
+    # Resumen Jaccard entre nucleos consistentes de pares de tasks (L2 = top layer)
+    overlap_summary = {}
+    for i in range(n_tasks):
+        for j in range(i + 1, n_tasks):
+            overlap_summary[f'T{i+1}_vs_T{j+1}'] = {
+                'jaccard_L1': jaccard(consistent_sets[i][0], consistent_sets[j][0]),
+                'jaccard_L2': jaccard(consistent_sets[i][1], consistent_sets[j][1]),
+            }
+
+    return acc_matrix, task_activations, overlap_summary
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -297,6 +415,30 @@ def cl_metrics_multitask(acc_matrix, n_tasks):
         'BWT_avg': bwt_avg,
         'Plasticity_avg': plasticity_avg,
         'Retention_ratio_avg': retention_avg,
+    }
+
+
+def specialization_metrics(task_activations, n_tasks, threshold=0.5):
+    """Para cada par de tasks (i, j) calcula specialization_index sobre las
+    activaciones de la capa recogida (top layer / encoder), y resume con
+    population_specialization. task_activations[t] son las activaciones
+    sobre el test set de la task t, recogidas justo despues de entrenarla
+    (mismo punto en el tiempo en que se mide peak_per_task)."""
+    pair_results = {}
+    si_values = []
+    for i in range(n_tasks):
+        for j in range(i + 1, n_tasks):
+            si = specialization_index(task_activations[i], task_activations[j])
+            pop_spec = population_specialization(si, threshold=threshold)
+            pair_results[f'T{i+1}_vs_T{j+1}'] = {
+                'population_specialization': pop_spec,
+                'mean_abs_SI': float(np.mean(np.abs(si))),
+            }
+            si_values.append(pop_spec)
+
+    return {
+        'pairs': pair_results,
+        'population_specialization_avg': float(np.mean(si_values)) if si_values else 0.0,
     }
 
 
@@ -437,23 +579,26 @@ if __name__ == '__main__':
 
     results = {}
     timing = {}
+    activations = {}
 
     print("\n[1/3] MLP Naive (3 tasks, class-incremental 10-way)")
     t0 = time.time()
-    results['mlp_naive'] = run_mlp_multitask(data, N_TASKS, epochs, use_ewc=False)
+    results['mlp_naive'], activations['mlp_naive'] = run_mlp_multitask(data, N_TASKS, epochs, use_ewc=False)
     timing['mlp_naive'] = time.time() - t0
 
     print("\n[2/3] MLP + EWC (3 tasks, class-incremental 10-way)")
     t0 = time.time()
-    results['mlp_ewc'] = run_mlp_multitask(data, N_TASKS, epochs, use_ewc=True)
+    results['mlp_ewc'], activations['mlp_ewc'] = run_mlp_multitask(data, N_TASKS, epochs, use_ewc=True)
     timing['mlp_ewc'] = time.time() - t0
 
-    print("\n[3/3] SPCN (3 tasks, class-incremental 10-way, local predictive coding)")
+    print(f"\n[3/3] SPCN (3 tasks, class-incremental 10-way, local predictive coding, "
+          f"sparse_frac={SPCN_SPARSE_FRAC})")
     t0 = time.time()
-    results['spcn'] = run_spcn_multitask(data, N_TASKS, epochs)
+    results['spcn'], activations['spcn'], spcn_overlap_log = run_spcn_multitask(data, N_TASKS, epochs)
     timing['spcn'] = time.time() - t0
 
     metrics = {m: cl_metrics_multitask(results[m], N_TASKS) for m in results}
+    spec_metrics = {m: specialization_metrics(activations[m], N_TASKS) for m in activations}
 
     print("\n" + "=" * 62)
     print("METRICAS FINALES — 3 TASKS (class-incremental)")
@@ -463,12 +608,15 @@ if __name__ == '__main__':
         for k, v in mx.items():
             tag = ' ← KEY' if k in ('BWT_avg', 'Retention_ratio_avg') else ''
             print(f"    {k:24s}: {v}{tag}")
+        print(f"    population_specialization_avg: {spec_metrics[m]['population_specialization_avg']:.4f}")
 
     with open(f'{OUT_DIR}/cl_3tasks_metrics.json', 'w') as f:
         json.dump({
             'task_splits': TASK_SPLITS,
+            'spcn_sparse_frac': SPCN_SPARSE_FRAC,
             'accuracy_matrix': results,
             'metrics': metrics,
+            'specialization_metrics': spec_metrics,
             'timing': timing,
         }, f, indent=2)
 
